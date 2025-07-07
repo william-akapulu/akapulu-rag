@@ -1,3 +1,61 @@
+"""
+mcp_server.py
+
+This script serves as the primary entry point for interacting with the RAG (Retrieval-Augmented
+Generation) system over a standardized communication channel. It uses the `FastMCP` 
+(Meta-Cognitive Process) framework to expose the retrieval capabilities of the 
+`HybridRAGSystem` as a "tool" that a larger AI agent or system can call.
+
+Conceptual Overview:
+--------------------
+The purpose of this server is to act as a bridge between a controlling agent (like a
+conversational AI) and the powerful RAG system. Instead of being a monolithic application,
+the system is decoupled:
+-   `embed_pdf_hybrid.py`: Handles data processing and embedding (ETL).
+-   `retrieve.py`: Provides the core logic for searching and retrieval.
+-   `mcp_server.py`: Exposes the retrieval logic as a simple, callable tool.
+
+This decoupling makes the system modular and scalable. The server is designed to be
+easily extensible, allowing you to add new RAG-powered tools for different document
+collections by simply defining a new function.
+
+Key Design Patterns:
+--------------------
+1.  **Lazy Initialization**: The `HybridRAGSystem` is not loaded when the server starts.
+    Instead, it's initialized on the first tool call (`if rag_system is None:`). This
+    saves memory and reduces startup time, which is especially useful if the server
+    is idle for long periods.
+
+2.  **Reusable Wrapper Function**: The `_perform_rag_search` function contains all the
+    core logic for performing a search. The actual tool functions (`search_nvidia_docs`)
+    are just thin wrappers that call this wrapper with the correct `namespace`. This
+    avoids code duplication and makes it trivial to add new tools for other namespaces.
+
+Adding and Removing Tools:
+--------------------------
+The server is designed for easy extension.
+
+**To Add a New Tool:**
+1.  Find the `search_nvidia_docs` function, which serves as a template.
+2.  Copy the entire function block, from the `@server.tool()` decorator to its `return` statement.
+3.  Paste it below the existing tool.
+4.  Rename the new function to something descriptive (e.g., `search_my_docs`).
+5.  Update the function's docstring. This is critical, as the docstring is what an AI agent will see when deciding whether to use your tool.
+6.  In the `return` statement, change the `namespace` to the name of the Pinecone namespace you want to search (e.g., `namespace="my-new-docs"`). This must be a namespace you have already populated using `embed_pdf_hybrid.py`.
+7.  Update the `tool_name` to match your new function name (e.g., `tool_name="search_my_docs"`).
+
+**To Remove a Tool:**
+-   Simply delete or comment out the entire function block for the tool you wish to remove, including its `@server.tool()` decorator.
+
+How to Run the Server:
+----------------------
+The server is designed to be run directly. It communicates over standard I/O (`stdio`),
+which is a common pattern for MCP servers.
+```bash
+python mcp_server.py
+```
+The server will then wait for tool call requests from a connected MCP client.
+"""
 import asyncio
 import json
 import logging
@@ -22,6 +80,12 @@ rag_system = None # Initialize lazily when first search is called
 async def _perform_rag_search(query: str, namespace: str, tool_name: str) -> CallToolResult:
     """
     A reusable wrapper that performs a cascading RAG search for a given namespace.
+
+    This function encapsulates the core retrieval logic, making the system extensible.
+    To add a new search tool for a different set of documents, you only need to create
+    a new tool function that calls this wrapper with the appropriate `namespace`.
+    
+    It also handles the lazy initialization of the HybridRAGSystem.
     """
     global rag_system
     try:
@@ -56,7 +120,12 @@ async def _perform_rag_search(query: str, namespace: str, tool_name: str) -> Cal
 # 3. DEFINE THE TOOL for NVIDIA docs, calling the wrapper
 @server.tool()
 async def search_nvidia_docs(query: str) -> CallToolResult:
-    """Search the NVIDIA documentation index.'.
+    """
+    Search the NVIDIA documentation index.
+
+    This is the main tool exposed by the server. It's a concrete implementation
+    that uses the `_perform_rag_search` wrapper to target the 'nvidia-docs' namespace.
+    When an agent calls the 'search_nvidia_docs' tool, this function is executed.
 
     Args:
         query: The search query to find relevant NVIDIA documentation.
@@ -84,7 +153,12 @@ async def search_nvidia_docs(query: str) -> CallToolResult:
 #     )
 
 def _format_search_results(results: List[SearchResult], query: str, tool_name: str) -> str:
-    """Format search results for display"""
+    """
+    Formats the raw search results from the RAG system into a clean, human-readable string.
+    
+    This structured output makes it easier for either a human or an LLM to understand
+    the search findings, including scores, sources, and content previews.
+    """
     if not results:
         return f"No results found for query: '{query}' in {tool_name}"
     

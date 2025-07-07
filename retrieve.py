@@ -1,3 +1,76 @@
+"""
+retrieve.py
+
+This script is the "retrieval" component of the RAG (Retrieval-Augmented Generation)
+system. Its primary role is to search the vector databases created by 
+`embed_pdf_hybrid.py` to find the most relevant document chunks for a given query.
+It is a powerful, standalone tool for testing and can also be used as a library
+by other parts of the application, like the `mcp_server.py`.
+
+Conceptual Overview: Advanced Retrieval Strategies
+--------------------------------------------------
+To maximize accuracy, this script implements several advanced retrieval strategies,
+which can be chosen at runtime:
+
+1.  Hybrid Search (Dense + Sparse):
+    -   Simultaneously queries both the dense (semantic) and sparse (keyword) indexes.
+    -   The results from each search are normalized to a 0-1 scale.
+    -   The scores are then combined using a weighted average (`dense_weight` and
+      `sparse_weight`) to produce a single, relevance-ranked list.
+    -   This method combines the "what it means" power of dense search with the
+      "what it says" precision of sparse search.
+
+2.  Reranking:
+    -   After an initial retrieval (e.g., from hybrid search), the top ~100 results
+      are passed to a separate, more powerful "reranker" model (like `bge-reranker-v2-m3`).
+    -   Unlike the initial retrieval models, a reranker's job is not to search over
+      millions of documents, but to take a small, promising set and re-score them
+      with much higher precision in the context of the original query.
+    -   This significantly improves the final quality of the results by pushing the
+      most relevant chunks to the very top.
+
+3.  Cascading Retrieval (The Default and Recommended Strategy):
+    -   This is a multi-stage process that combines the above techniques for the best results:
+      -   **Stage 1: Broad Recall.** Perform a Hybrid Search to retrieve a large number
+        of potentially relevant documents (e.g., 100 candidates).
+      -   **Stage 2: High Precision.** Use the Reranker model to re-evaluate these
+        100 candidates and select the final top K (e.g., 10) results.
+    -   This cascade ensures that we first cast a wide net to not miss anything
+      (recall) and then apply a fine-toothed comb to ensure the top results are
+      extremely accurate (precision).
+
+Prerequisites:
+--------------
+Before running this script, ensure you have a `.env` file in the project root
+with your Pinecone API key:
+    ```
+    PINECONE_API_KEY="your-pinecone-api-key-here"
+    ```
+
+Command-Line Usage:
+-------------------
+The script can be run directly from the command line for testing retrieval.
+
+1.  To perform a default cascading search:
+    ```bash
+    python retrieve.py "how does the ACE framework work?" --namespace nvidia-docs
+    ```
+
+2.  To use a different strategy (e.g., hybrid without reranking):
+    ```bash
+    python retrieve.py "search for HybridRAGSystem" --strategy hybrid --namespace nvidia-docs
+    ```
+
+3.  To adjust weights and thresholds:
+    ```bash
+    python retrieve.py "query" --dense-weight 0.5 --sparse-weight 0.5 --min-score 0.3
+    ```
+
+4.  To see index statistics:
+    ```bash
+    python retrieve.py "any query" --stats
+    ```
+"""
 import os
 import argparse
 import logging
@@ -38,13 +111,14 @@ class SearchConfig:
 
 class HybridRAGSystem:
     """
-    Advanced RAG system with hybrid search and cascading retrieval.
+    Orchestrates advanced RAG retrieval with hybrid search and cascading reranking.
     
-    Implements the following search strategies:
-    1. Dense-only search (semantic)
-    2. Sparse-only search (keyword/lexical)
-    3. Hybrid search (dense + sparse combined)
-    4. Cascading retrieval with reranking
+    This class is the main engine for the retrieval process. It encapsulates the logic for:
+    - Connecting to Pinecone indexes.
+    - Performing various types of searches (dense, sparse, hybrid).
+    - Merging and normalizing results from different search types.
+    - Applying a final reranking step for precision.
+    - Providing a single, clean interface (`search`) to execute different strategies.
     """
     
     def __init__(self, dense_index_name: str = "nvidia-docs", sparse_index_name: str = "nvidia-docs-sparse"):
@@ -83,7 +157,10 @@ class HybridRAGSystem:
     
     def dense_search(self, query: str, namespace: str = "__default__", top_k: int = 10) -> List[SearchResult]:
         """
-        Perform semantic search using dense vectors.
+        Performs a semantic search using only the dense vector index.
+        
+        This search is good for finding results based on conceptual meaning and context,
+        rather than exact keyword matches.
         
         Args:
             query: Search query
@@ -137,7 +214,10 @@ class HybridRAGSystem:
     
     def sparse_search(self, query: str, namespace: str = "__default__", top_k: int = 10) -> List[SearchResult]:
         """
-        Perform lexical/keyword search using sparse vectors.
+        Performs a lexical/keyword search using only the sparse vector index.
+        
+        This search excels at finding documents that contain specific keywords, jargon,
+        or function names mentioned in the query.
         
         Args:
             query: Search query
@@ -198,7 +278,10 @@ class HybridRAGSystem:
                      namespace: str = "__default__",
                      config: SearchConfig = SearchConfig()) -> List[SearchResult]:
         """
-        Perform hybrid search combining dense and sparse results.
+        Performs a hybrid search by combining results from both dense and sparse indexes.
+        
+        This method is the first stage of the cascading retrieval pipeline. It aims for
+        high recall by fetching candidates from two different retrieval paradigms.
         
         Args:
             query: Search query
@@ -225,9 +308,13 @@ class HybridRAGSystem:
                       sparse_results: List[SearchResult],
                       config: SearchConfig) -> List[SearchResult]:
         """
-        Merge dense and sparse results with score normalization.
-        
-        Uses a weighted combination approach for scoring.
+        Merges and re-scores dense and sparse results using a weighted, normalized approach.
+
+        This is a critical step in hybrid search. Because dense and sparse search scores
+        are not directly comparable, this function first normalizes each set of scores
+        to a 0-1 range. It then applies the configured weights (`dense_weight`,
+        `sparse_weight`) and combines the scores for documents that appear in both result
+        sets. This creates a unified ranking that reflects both semantic and lexical relevance.
         """
         logger.info(f"Merging {len(dense_results)} dense results and {len(sparse_results)} sparse results.")
         # Create a dictionary to store merged results
@@ -284,7 +371,12 @@ class HybridRAGSystem:
                       top_k: int = 10,
                       model: str = "bge-reranker-v2-m3") -> List[SearchResult]:
         """
-        Rerank search results using Pinecone's hosted reranking models.
+        Reranks a list of search results using a powerful cross-encoder model.
+
+        This is the precision-enhancing stage of the retrieval pipeline. It takes a list
+        of promising candidates (e.g., the top 100 from a hybrid search) and uses a
+        more computationally intensive model to perform a fine-grained re-evaluation
+        of their relevance to the query. This pushes the most accurate results to the top.
         
         Args:
             query: Original search query
@@ -349,9 +441,11 @@ class HybridRAGSystem:
                         namespace: str = "__default__",
                         config: SearchConfig = SearchConfig()) -> List[SearchResult]:
         """
-        Perform cascading retrieval: hybrid search → reranking.
+        Implements the full cascading retrieval pipeline: Hybrid Search -> Rerank.
         
-        This is the recommended approach for maximum accuracy.
+        This is the recommended, state-of-the-art approach for most use cases. It
+        maximizes both recall (by getting a broad set of candidates via hybrid search)
+        and precision (by using a powerful reranker to refine the final results).
         
         Args:
             query: Search query
@@ -396,7 +490,11 @@ class HybridRAGSystem:
                strategy: str = "cascading",
                config: SearchConfig = SearchConfig()) -> List[SearchResult]:
         """
-        Main search interface with multiple strategies.
+        The main public search interface for the RAG system.
+        
+        This method acts as a dispatcher, allowing the caller to easily select a
+        retrieval strategy ('dense', 'sparse', 'hybrid', or 'cascading') without
+        needing to call the underlying methods directly.
         
         Args:
             query: Search query
@@ -476,7 +574,13 @@ def print_results(results: List[SearchResult], query: str, config: SearchConfig 
         print("-" * 40)
 
 def main():
-    """Main function with CLI interface"""
+    """
+    Main function to provide a Command-Line Interface (CLI) for the RAG system.
+    
+    This function uses `argparse` to allow a user to run searches directly from the
+    terminal. It's an invaluable tool for testing the retrieval pipeline, experimenting
+    with different strategies, and inspecting the contents of the vector indexes.
+    """
     parser = argparse.ArgumentParser(description="Advanced RAG inference with hybrid search and reranking")
     parser.add_argument("query", help="Search query")
     parser.add_argument("--namespace", default="nvidia-docs", help="Pinecone namespace (default: nvidia-docs)")
