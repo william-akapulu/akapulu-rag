@@ -1,0 +1,52 @@
+# FastAPI and server dependencies
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+python-dotenv>=1.0.0
+
+# LangChain ecosystem
+langchain>=0.1.0
+langchain-openai>=0.0.2
+langchain-pinecone>=0.0.1
+langchain-community>=0.0.10
+langchain-core>=0.1.0
+
+# Vector database - using the latest compatible version
+pinecone-client>=6.0.0
+
+# OpenAI
+openai>=1.6.0
+
+# Document processing
+pypdf>=3.17.0
+python-docx>=1.1.0
+beautifulsoup4>=4.12.0
+requests>=2.31.0
+markdown
+
+# Text processing and utilities
+tiktoken>=0.5.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Git repository support
+GitPython>=3.1.0
+unstructured[html,pdf]
+
+# Development and testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+black>=23.12.0
+flake8>=6.1.0
+
+# CORS for API
+fastapi-cors>=0.0.6
+
+# MCP server dependencies
+mcp>=1.0.0
+pydantic>=2.0.0
+
+# New dependencies
+loguru==0.7.2
+numpy==1.26.4
+python-dotenv==1.0.1 

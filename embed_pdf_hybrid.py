@@ -1,0 +1,575 @@
+import os
+import glob
+import re
+import hashlib
+import argparse
+import tempfile
+import shutil
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+from dotenv import load_dotenv
+from pinecone import Pinecone
+from langchain_community.document_loaders import UnstructuredHTMLLoader, UnstructuredPDFLoader
+from langchain_community.document_loaders import TextLoader, UnstructuredMarkdownLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+import logging
+import git
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+
+# File extensions to index from git repositories
+CODE_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".cpp", ".c", ".h", ".hpp", ".java", ".go", ".rs", ".rb", ".php"}
+DOC_EXTENSIONS = {".md", ".rst", ".txt", ".mdx"}
+
+def sanitize_id(text: str) -> str:
+    """
+    Sanitize text to create ASCII-compatible IDs for Pinecone.
+    Replaces non-ASCII characters and special characters with underscores.
+    """
+    # Replace non-ASCII characters with underscores
+    ascii_text = text.encode('ascii', 'ignore').decode('ascii')
+    # Replace spaces and special characters with underscores
+    sanitized = re.sub(r'[^\w\-]', '_', ascii_text)
+    # Remove multiple consecutive underscores
+    sanitized = re.sub(r'_+', '_', sanitized)
+    # Remove leading/trailing underscores
+    sanitized = sanitized.strip('_')
+    return sanitized
+
+class HybridDocsEmbedder:
+    ALLOWED_NAMESPACES = {'nvidia-docs'}
+
+    def __init__(self):
+        """Initialize the embedder with both dense and sparse Pinecone indexes"""
+        self.pinecone_api_key = os.getenv("PINECONE_API_KEY")
+        self.dense_index_name = "nvidia-docs"
+        self.sparse_index_name = "nvidia-docs-sparse"
+        
+        if not self.pinecone_api_key:
+            raise ValueError("PINECONE_API_KEY environment variable is required")
+        
+        # Initialize Pinecone client
+        self.pc = Pinecone(api_key=self.pinecone_api_key)
+        
+        # Connect to both indexes
+        try:
+            self.dense_index = self.pc.Index(self.dense_index_name)
+            logger.info(f"Connected to dense index: {self.dense_index_name}")
+        except Exception as e:
+            logger.error(f"Failed to connect to dense index: {e}")
+            raise
+        
+        try:
+            self.sparse_index = self.pc.Index(self.sparse_index_name)
+            logger.info(f"Connected to sparse index: {self.sparse_index_name}")
+        except Exception as e:
+            logger.warning(f"Sparse index not available: {e}")
+            self.sparse_index = None
+        
+        # Initialize text splitter for chunking
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=2000,
+            chunk_overlap=200,
+            length_function=len,
+            separators=["\n\n", "\n", " ", ""]
+        )
+        
+        # Separate text splitter for code (smaller chunks to preserve function boundaries)
+        self.code_text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=100,
+            length_function=len,
+            separators=["\n\n", "\nclass ", "\ndef ", "\n\n", "\n", " ", ""]
+        )
+    
+    def _validate_namespace(self, namespace: str):
+        """Ensure the provided namespace is valid."""
+        if namespace not in self.ALLOWED_NAMESPACES:
+            raise ValueError(
+                f"Invalid namespace '{namespace}'. Must be one of {list(self.ALLOWED_NAMESPACES)}."
+            )
+
+    def load_local_files(self, folder_path: str) -> List[Document]:
+        """Load all HTML and PDF files from the specified folder"""
+        file_paths = glob.glob(os.path.join(folder_path, "*.html")) + \
+                     glob.glob(os.path.join(folder_path, "*.pdf"))
+        
+        if not file_paths:
+            logger.warning(f"No HTML or PDF files found in {folder_path}")
+            return []
+        
+        documents = []
+        for file_path in file_paths:
+            file_ext = os.path.splitext(file_path)[1].lower()
+            try:
+                if file_ext == ".html":
+                    logger.info(f"Loading HTML file: {file_path}")
+                    loader = UnstructuredHTMLLoader(file_path)
+                    file_type = "html"
+                elif file_ext == ".pdf":
+                    logger.info(f"Loading PDF file: {file_path}")
+                    loader = UnstructuredPDFLoader(file_path)
+                    file_type = "pdf"
+                else:
+                    continue
+                
+                docs = loader.load()
+                
+                # Add metadata
+                for doc in docs:
+                    doc.metadata.update({
+                        "source": file_path,
+                        "filename": os.path.basename(file_path),
+                        "file_type": file_type,
+                        "content_type": "documentation"
+                    })
+                
+                documents.extend(docs)
+                logger.info(f"Successfully loaded {len(docs)} documents from {file_path}")
+                
+            except Exception as e:
+                logger.error(f"Error loading file {file_path}: {str(e)}")
+                continue
+        
+        return documents
+    
+    def load_git_repository(self, repo_url: str, branch: str = "main", skip_dirs: Optional[List[str]] = None) -> List[Document]:
+        """
+        Clone a git repository and load relevant files as documents
+        
+        Args:
+            repo_url: URL of the git repository to clone
+            branch: Branch to clone (default: main)
+            skip_dirs: Optional list of directory names to skip
+            
+        Returns:
+            List of Document objects from the repository
+        """
+        logger.info(f"Cloning repository: {repo_url} (branch: {branch})")
+        
+        # Create temporary directory for cloning
+        temp_dir = tempfile.mkdtemp()
+        repo_name = repo_url.split('/')[-1].replace('.git', '')
+        
+        try:
+            # Clone the repository
+            repo = git.Repo.clone_from(repo_url, temp_dir, branch=branch, depth=1)
+            logger.info(f"Successfully cloned {repo_url} to {temp_dir}")
+            
+            # Load files from the cloned repository
+            documents = self._load_repo_files(temp_dir, repo_name, skip_dirs=skip_dirs)
+            
+            return documents
+            
+        except Exception as e:
+            logger.error(f"Error cloning repository {repo_url}: {str(e)}")
+            return []
+        finally:
+            # Clean up temporary directory
+            try:
+                shutil.rmtree(temp_dir)
+                logger.info(f"Cleaned up temporary directory: {temp_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up temp directory {temp_dir}: {str(e)}")
+    
+    def _load_repo_files(self, repo_path: str, repo_name: str, skip_dirs: Optional[List[str]] = None) -> List[Document]:
+        """
+        Load relevant files from a local git repository
+        
+        Args:
+            repo_path: Path to the local repository
+            repo_name: Name of the repository for metadata
+            skip_dirs: Optional list of directory names to skip
+            
+        Returns:
+            List of Document objects
+        """
+        documents = []
+        repo_path_obj = Path(repo_path)
+        
+        # Skip common directories we don't want to index
+        default_skip_dirs = {'.git', '.github','__pycache__', 'node_modules', '.pytest_cache', 'venv', '.venv', 'env', '.env', '.lock', '.gitignore', '.gitattributes','.DS_Store', '.vscode', 'CLA.md', 'CONTRIBUTING.md', 'CONTRIBUTORS.md', 'CONTRIBUTORS.txt', 'CONTRIBUTORS.yml', 'CONTRIBUTORS.yaml', 'CONTRIBUTORS.json', 'CONTRIBUTORS.csv', 'CONTRIBUTORS.tsv', 'CONTRIBUTORS.txt', 'CONTRIBUTORS.yml', 'CONTRIBUTORS.yaml', 'CONTRIBUTORS.json', 'CONTRIBUTORS.csv', 'CONTRIBUTORS.tsv', 'LICENSE.md', 'LICENSE.txt', 'LICENSE.yml', 'LICENSE.yaml', 'LICENSE.json', 'LICENSE.csv', 'LICENSE.tsv', 'LICENSE.txt', 'LICENSE.yml', 'LICENSE.yaml', 'LICENSE.json', 'LICENSE.csv', 'LICENSE.tsv', 'LICENSE'}
+        
+        # Add user-provided directories to skip
+        if skip_dirs:
+            directories_to_skip = default_skip_dirs.union(set(skip_dirs))
+        else:
+            directories_to_skip = default_skip_dirs
+            
+        logger.info(f"Skipping directories: {sorted(list(directories_to_skip))}")
+        
+        for file_path in repo_path_obj.rglob("*"):
+            # Skip if it's a directory
+            if file_path.is_dir():
+                continue
+                
+            # Skip if it's in a directory we want to ignore
+            if any(skip_dir in file_path.parts for skip_dir in directories_to_skip):
+                continue
+                
+            # Skip if file is too large (> 1MB)
+            try:
+                if file_path.stat().st_size > 1024 * 1024:
+                    logger.debug(f"Skipping large file: {file_path}")
+                    continue
+            except OSError:
+                continue
+            
+            file_ext = file_path.suffix.lower()
+            
+            try:
+                if file_ext in CODE_EXTENSIONS:
+                    # Load code files
+                    loader = TextLoader(str(file_path), autodetect_encoding=True)
+                    docs = loader.load()
+                    content_type = "code"
+                    
+                elif file_ext in DOC_EXTENSIONS:
+                    # Load documentation files
+                    if file_ext == ".md" or file_ext == ".mdx":
+                        loader = UnstructuredMarkdownLoader(str(file_path))
+                    else:
+                        loader = TextLoader(str(file_path), autodetect_encoding=True)
+                    docs = loader.load()
+                    content_type = "documentation"
+                    
+                else:
+                    # Skip files with extensions we don't handle
+                    continue
+                
+                # Add metadata to each document
+                for doc in docs:
+                    relative_path = file_path.relative_to(repo_path_obj)
+                    doc.metadata.update({
+                        "source": str(file_path),
+                        "filename": file_path.name,
+                        "file_type": file_ext.lstrip("."),
+                        "content_type": content_type,
+                        "repo_name": repo_name,
+                        "repo_path": str(relative_path)
+                    })
+                
+                documents.extend(docs)
+                logger.debug(f"Loaded {len(docs)} documents from {file_path}")
+                
+            except Exception as e:
+                logger.warning(f"Error loading file {file_path}: {str(e)}")
+                continue
+        
+        logger.info(f"Successfully loaded {len(documents)} documents from repository {repo_name}")
+        return documents
+    
+    def chunk_documents(self, documents: List[Document]) -> List[Document]:
+        """Split documents into smaller chunks, using different strategies for code vs docs"""
+        logger.info(f"Chunking {len(documents)} documents...")
+        
+        chunks = []
+        for doc in documents:
+            # Use different chunking strategy for code vs documentation
+            content_type = doc.metadata.get('content_type', 'documentation')
+            
+            if content_type == 'code':
+                doc_chunks = self.code_text_splitter.split_documents([doc])
+            else:
+                doc_chunks = self.text_splitter.split_documents([doc])
+            
+            # Add chunk metadata
+            for i, chunk in enumerate(doc_chunks):
+                filename = chunk.metadata.get('filename', 'unknown')
+                repo_name = chunk.metadata.get('repo_name', '')
+                
+                # Create a unique chunk ID
+                if repo_name:
+                    chunk_id = f"{sanitize_id(repo_name)}_{sanitize_id(filename)}_{i}"
+                else:
+                    chunk_id = f"{sanitize_id(filename)}_{i}"
+                
+                chunk.metadata.update({
+                    "chunk_id": chunk_id,
+                    "chunk_index": i,
+                    "total_chunks": len(doc_chunks)
+                })
+            
+            chunks.extend(doc_chunks)
+        
+        logger.info(f"Created {len(chunks)} chunks")
+        return chunks
+    
+    def embed_to_dense_index(self, documents: List[Document], namespace: str = "__default__") -> None:
+        """Embed documents to dense index using integrated embedding"""
+        logger.info(f"Embedding {len(documents)} documents to DENSE index in namespace: {namespace}")
+        
+        records_to_upsert = []
+        batch_size = 96
+        
+        for i, doc in enumerate(documents):
+            chunk_id = doc.metadata.get('chunk_id', 'unknown')
+            vector_id = f"doc_{i}_{sanitize_id(chunk_id)}"
+            
+            record_data = {
+                "_id": vector_id,
+                "text": doc.page_content,
+                "source": doc.metadata.get("source", ""),
+                "filename": doc.metadata.get("filename", ""),
+                "file_type": doc.metadata.get("file_type", ""),
+                "chunk_id": doc.metadata.get("chunk_id", ""),
+                "chunk_index": doc.metadata.get("chunk_index", 0),
+                "total_chunks": doc.metadata.get("total_chunks", 1)
+            }
+            
+            records_to_upsert.append(record_data)
+            
+            if len(records_to_upsert) >= batch_size or i == len(documents) - 1:
+                try:
+                    response = self.dense_index.upsert_records(namespace, records_to_upsert)
+                    logger.info(f"Dense: Successfully upserted batch of {len(records_to_upsert)} records")
+                    records_to_upsert = []
+                except Exception as e:
+                    logger.error(f"Dense: Error upserting batch: {str(e)}")
+                    records_to_upsert = []
+    
+    def embed_to_sparse_index(self, documents: List[Document], namespace: str = "__default__") -> None:
+        """Embed documents to sparse index using integrated sparse embedding"""
+        if self.sparse_index is None:
+            logger.warning("Sparse index not available, skipping sparse embedding")
+            return
+        
+        logger.info(f"Embedding {len(documents)} documents to SPARSE index in namespace: {namespace}")
+        
+        records_to_upsert = []
+        batch_size = 96
+        
+        for i, doc in enumerate(documents):
+            chunk_id = doc.metadata.get('chunk_id', 'unknown')
+            vector_id = f"doc_{i}_{sanitize_id(chunk_id)}"
+            
+            record_data = {
+                "_id": vector_id,
+                "text": doc.page_content,
+                "source": doc.metadata.get("source", ""),
+                "filename": doc.metadata.get("filename", ""),
+                "file_type": doc.metadata.get("file_type", ""),
+                "chunk_id": doc.metadata.get("chunk_id", ""),
+                "chunk_index": doc.metadata.get("chunk_index", 0),
+                "total_chunks": doc.metadata.get("total_chunks", 1)
+            }
+            
+            records_to_upsert.append(record_data)
+            
+            if len(records_to_upsert) >= batch_size or i == len(documents) - 1:
+                try:
+                    response = self.sparse_index.upsert_records(namespace, records_to_upsert)
+                    logger.info(f"Sparse: Successfully upserted batch of {len(records_to_upsert)} records")
+                    records_to_upsert = []
+                except Exception as e:
+                    logger.error(f"Sparse: Error upserting batch: {str(e)}")
+                    records_to_upsert = []
+    
+    def embed_documents(self, documents: List[Document], namespace: str = "__default__") -> None:
+        """Embed documents to both dense and sparse indexes"""
+        logger.info(f"Starting hybrid embedding process for {len(documents)} documents")
+        
+        # Upload to dense index
+        self.embed_to_dense_index(documents, namespace)
+        
+        # Upload to sparse index
+        self.embed_to_sparse_index(documents, namespace)
+        
+        logger.info("Hybrid embedding process completed!")
+    
+    def get_index_stats(self) -> Dict[str, Any]:
+        """Get current index statistics for both indexes"""
+        stats = {}
+        
+        try:
+            dense_stats = self.dense_index.describe_index_stats()
+            stats['dense'] = dense_stats
+        except Exception as e:
+            logger.error(f"Error getting dense index stats: {str(e)}")
+        
+        if self.sparse_index:
+            try:
+                sparse_stats = self.sparse_index.describe_index_stats()
+                stats['sparse'] = sparse_stats
+            except Exception as e:
+                logger.error(f"Error getting sparse index stats: {str(e)}")
+        
+        return stats
+    
+    def process_folder(self, folder_path: str, namespace: str = "__default__") -> None:
+        """Main method to process all HTML files in a folder"""
+        self._validate_namespace(namespace)
+        logger.info(f"Starting hybrid processing of folder: {folder_path}")
+        logger.info(f"Target namespace: {namespace}")
+        
+        if not os.path.exists(folder_path):
+            raise FileNotFoundError(f"Folder not found: {folder_path}")
+        
+        # Load HTML files
+        documents = self.load_local_files(folder_path)
+        
+        if not documents:
+            logger.warning("No documents loaded. Exiting.")
+            return
+        
+        # Chunk documents
+        chunks = self.chunk_documents(documents)
+        
+        # Embed documents to both indexes
+        self.embed_documents(chunks, namespace)
+        
+        # Show final stats
+        stats = self.get_index_stats()
+        logger.info(f"Final index stats: {stats}")
+    
+    def process_git_repo(self, repo_url: str, branch: str = "main", namespace: str = "__default__", skip_dirs: Optional[List[str]] = None) -> None:
+        """Main method to process a git repository"""
+        self._validate_namespace(namespace)
+        logger.info(f"Starting hybrid processing of git repository: {repo_url}")
+        logger.info(f"Branch: {branch}")
+        logger.info(f"Target namespace: {namespace}")
+        
+        # Load git repository
+        documents = self.load_git_repository(repo_url, branch, skip_dirs=skip_dirs)
+        
+        if not documents:
+            logger.warning("No documents loaded from repository. Exiting.")
+            return
+        
+        # Chunk documents
+        chunks = self.chunk_documents(documents)
+        
+        # Embed documents to both indexes
+        self.embed_documents(chunks, namespace)
+        
+        # Show final stats
+        stats = self.get_index_stats()
+        logger.info(f"Final index stats: {stats}")
+    
+    def process_mixed_sources(self, folder_path: Optional[str] = None, repo_url: Optional[str] = None, 
+                             branch: str = "main", namespace: str = "__default__", skip_dirs: Optional[List[str]] = None) -> None:
+        """Process both HTML files and git repository together"""
+        self._validate_namespace(namespace)
+        logger.info("Starting hybrid processing of mixed sources")
+        logger.info(f"Target namespace: {namespace}")
+        
+        all_documents = []
+        
+        # Load HTML files if folder provided
+        if folder_path:
+            if not os.path.exists(folder_path):
+                raise FileNotFoundError(f"Folder not found: {folder_path}")
+            local_docs = self.load_local_files(folder_path)
+            all_documents.extend(local_docs)
+            logger.info(f"Loaded {len(local_docs)} HTML and PDF documents")
+        
+        # Load git repository if URL provided
+        if repo_url:
+            repo_docs = self.load_git_repository(repo_url, branch, skip_dirs=skip_dirs)
+            all_documents.extend(repo_docs)
+            logger.info(f"Loaded {len(repo_docs)} repository documents")
+        
+        if not all_documents:
+            logger.warning("No documents loaded from any source. Exiting.")
+            return
+        
+        logger.info(f"Total documents loaded: {len(all_documents)}")
+        
+        # Chunk documents
+        chunks = self.chunk_documents(all_documents)
+        
+        # Embed documents to both indexes
+        self.embed_documents(chunks, namespace)
+        
+        # Show final stats
+        stats = self.get_index_stats()
+        logger.info(f"Final index stats: {stats}")
+
+def main():
+    """Main function to run the hybrid embedding process"""
+    parser = argparse.ArgumentParser(description="Embed HTML documents and git repositories into both dense and sparse Pinecone indexes")
+    parser.add_argument(
+        "--namespace", 
+        type=str, 
+        default="__default__",
+        help="Pinecone namespace to store the documents (default: __default__)"
+    )
+    parser.add_argument(
+        "--folder", 
+        type=str, 
+        help="Folder containing HTML files to process"
+    )
+    parser.add_argument(
+        "--repo-url",
+        type=str,
+        help="Git repository URL to clone and process"
+    )
+    parser.add_argument(
+        "--branch",
+        type=str,
+        default="main",
+        help="Git branch to clone (default: main)"
+    )
+    parser.add_argument(
+        "--skip-dirs",
+        type=str,
+        nargs='+',
+        default=[],
+        help="List of directories to skip when processing a git repository (e.g., docs tests)"
+    )
+    
+    args = parser.parse_args()
+    
+    # Validate that at least one source is provided
+    if not args.folder and not args.repo_url:
+        parser.error("Must provide either --folder or --repo-url (or both)")
+    
+    try:
+        # Initialize hybrid embedder
+        embedder = HybridDocsEmbedder()
+        
+        # Determine folder path if provided
+        folder_path = None
+        if args.folder:
+            if os.path.isabs(args.folder):
+                folder_path = args.folder
+            else:
+                folder_path = os.path.join(os.path.dirname(__file__), args.folder)
+        
+        # Process sources
+        if args.folder and args.repo_url:
+            # Process both HTML files and git repository
+            embedder.process_mixed_sources(
+                folder_path=folder_path,
+                repo_url=args.repo_url,
+                branch=args.branch,
+                namespace=args.namespace,
+                skip_dirs=args.skip_dirs
+            )
+        elif args.repo_url:
+            # Process only git repository
+            embedder.process_git_repo(
+                repo_url=args.repo_url,
+                branch=args.branch,
+                namespace=args.namespace,
+                skip_dirs=args.skip_dirs
+            )
+        else:
+            # Process only HTML files
+            if folder_path:
+                embedder.process_folder(folder_path, args.namespace)
+            else:
+                logger.error("No folder path provided for HTML processing")
+        
+    except Exception as e:
+        logger.error(f"Error in main process: {str(e)}")
+        raise
+
+if __name__ == "__main__":
+    main() 

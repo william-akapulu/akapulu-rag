@@ -1,0 +1,18 @@
+# Ignore everything by default
+*
+
+# Whitelist the files to be tracked
+!mcp_server.py
+!embed_pdf_hybrid.py
+!retrieve.py
+!requirements.txt
+!.gitignore
+!README.md
+
+# Common Python ignores
+__pycache__/
+venv/
+.env*
+
+# macOS specific
+.DS_Store
