@@ -139,4 +139,32 @@ Here is a sample configuration. You will need to adjust the paths to be the **ab
 -   `"command"`: The **absolute path** to the executable that will run the server. For Python projects, this should be the `python` or `python3` binary located inside your virtual environment's `bin` directory. This is critical to ensure the server runs with the correct dependencies installed in the `venv`.
 -   `"args"`: A list of arguments to pass to the command. The first and only argument here should be the **absolute path** to the server script, `mcp_server.py`.
 
-Once this file is in place and the paths are correct, the AI assistant will automatically be able to find and use the `search_nvidia_docs` tool.
+### Verifying the Integration in Cursor
+
+Once the `.cursor/mcp.json` file is saved with the correct absolute paths, you can verify that the AI assistant has recognized the tool server.
+
+1.  Open Cursor's settings (press `Cmd + ,` on macOS or `Ctrl + ,` on Windows/Linux).
+2.  Navigate to the **Tools & Integrations** section.
+3.  You should see your `access-rag-db` server listed under "MCP Servers", indicating that Cursor has successfully loaded the configuration.
+
+*Placeholder for screenshot of Cursor's Tools & Integrations settings here.*
+![Cursor Settings](assets/Cursor%20Settings.png)
+
+### Troubleshooting
+
+If the tool does not appear in the settings or fails to run, you can check the logs for errors.
+1. Open the terminal panel in Cursor (press `Ctrl + \``).
+2. Go to the **OUTPUT** tab (usually next to TERMINAL, DEBUG CONSOLE, etc.).
+3. In the dropdown menu on the right side of the OUTPUT panel, select **MCP Logs**.
+This will show you the startup logs, standard output, and any errors from your `mcp_server.py` script.
+
+### Example in Practice
+
+With the server running, you can now use the tools in your chat with the AI. The `.cursor/mcp.json` file tells the assistant: "When you are in this project, you have access to a new set of tools. The instructions for running the server that provides these tools are right here."
+
+For example, when you ask the assistant a question like:
+> "Hey, can you search the NVIDIA docs for information on TensorRT?"
+
+The assistant will see that it has a `search_nvidia_docs` tool available (because `mcp_server.py` defines it), recognize that it's a good fit for your query, and use the `command` and `args` from `mcp.json` to execute the search and get back the results.
+
+![Tool Call In Action](assets/Tool%20Call%20In%20Action.png)
