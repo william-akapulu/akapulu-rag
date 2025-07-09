@@ -120,12 +120,7 @@ async def _perform_rag_search(query: str, namespace: str, tool_name: str) -> Cal
 # 3. DEFINE THE TOOL for NVIDIA docs, calling the wrapper
 @server.tool()
 async def search_nvidia_docs(query: str) -> CallToolResult:
-    """
-    Search the NVIDIA documentation index.
-
-    This is the main tool exposed by the server. It's a concrete implementation
-    that uses the `_perform_rag_search` wrapper to target the 'nvidia-docs' namespace.
-    When an agent calls the 'search_nvidia_docs' tool, this function is executed.
+    """Search NVIDIA documentation using Retrieval-Augmented Generation (RAG).
 
     Args:
         query: The search query to find relevant NVIDIA documentation.
@@ -134,6 +129,19 @@ async def search_nvidia_docs(query: str) -> CallToolResult:
         query=query, 
         namespace="nvidia-docs", 
         tool_name="search_nvidia_docs"
+    )
+
+@server.tool()
+async def search_cursor_docs(query: str) -> CallToolResult:
+    """Search Cursor documentation using Retrieval-Augmented Generation (RAG).
+
+    Args:
+        query: The search query to find relevant Cursor documentation.
+    """
+    return await _perform_rag_search(
+        query=query,
+        namespace="cursor-docs",
+        tool_name="search_cursor_docs"
     )
 
 # 4. READY FOR THE FUTURE: To add a new tool, just copy the one above and change the details.

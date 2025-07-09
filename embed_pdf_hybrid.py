@@ -139,7 +139,7 @@ class HybridDocsEmbedder:
         integrated embedding features, which simplifies the process by not requiring a
         separate embedding model call in this script.
     """
-    ALLOWED_NAMESPACES = {'nvidia-docs'}
+    ALLOWED_NAMESPACES = {'nvidia-docs', 'cursor-docs'}
 
     def __init__(self):
         """
